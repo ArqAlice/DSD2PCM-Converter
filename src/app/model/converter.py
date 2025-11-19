@@ -9,7 +9,14 @@ import numpy as np
 import soundfile as sf
 
 from .dsf_reader import DsfReader
-from .dsp import design_kaiser_lowpass, fir_decimate_chunk_stateless
+from .dsp import (
+    design_kaiser_lowpass,
+    create_fir_decimator_state,
+    process_block_fir_decimate,
+    create_cic_decimator_state,
+    process_block_cic_decimate,
+    choose_cic_fir_decim_factors,
+)
 from .tagging import copy_tags_dsf_to_flac
 
 
@@ -244,6 +251,157 @@ def convert_dsf_to_flac(
 
                 # すべての in-flight チャンクを書き切る
                 flush_completed(bound=False)
+
+        finally:
+            reader.close()
+
+        # タグコピー
+        try:
+            copy_tags_dsf_to_flac(src, dst)
+        except Exception as tag_exc:  # noqa: BLE001
+            return ConversionResult(
+                True,
+                src,
+                dst,
+                f"Converted, but failed to copy tags: {tag_exc}",
+            )
+
+        return ConversionResult(True, src, dst, "OK")
+
+    except Exception as exc:  # noqa: BLE001
+        return ConversionResult(False, src, None, f"Error: {exc}")
+
+
+def convert_dsf_to_flac_cic(
+    src_path: str | Path,
+    settings: ConversionSettings,
+) -> ConversionResult:
+    """CIC + FIR の 2 段デシメータを使った DSF -> FLAC 変換。
+
+    - 1 ファイル内はシングルプロセス・ストリーミング処理
+    - 初段: CIC (order=3, decim=D_cic)
+    - 後段: FIR (Kaiser) + decim=D_fir
+    """
+    src = Path(src_path)
+    try:
+        if not src.exists():
+            return ConversionResult(False, src, None, "Source file does not exist.")
+
+        out_dir = settings.output_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dst = out_dir / (src.stem + ".flac")
+
+        reader = DsfReader(src)
+        try:
+            fs_dsd = reader.sample_rate
+            channels = reader.channels
+
+            fs_pcm = int(settings.pcm_samplerate)
+            if fs_pcm <= 0:
+                return ConversionResult(False, src, None, "PCM sample rate must be positive.")
+
+            if fs_dsd % fs_pcm != 0:
+                msg = (
+                    f"DSD sample rate {fs_dsd} is not an integer multiple of "
+                    f"target PCM rate {fs_pcm}."
+                )
+                return ConversionResult(False, src, None, msg)
+
+            total_decim = fs_dsd // fs_pcm
+
+            # 総デシメーションを CIC + FIR に分割
+            D_cic, D_fir = choose_cic_fir_decim_factors(total_decim, max_cic=32)
+
+            # 全部 FIR に任せる fallback
+            if D_cic == 1:
+                # 既存の単段 FIR 版にフォールバックさせたい場合はここで呼び換える
+                return convert_dsf_to_flac(src, settings)  # 単段版がある前提
+
+            # --- 初段 CIC の設計 ---
+            cic_order = 3  # 典型値。必要に応じて 4〜5 に変更可。
+            cic_state = create_cic_decimator_state(
+                num_channels=int(channels),
+                order=cic_order,
+                decim=int(D_cic),
+            )
+
+            fs_after_cic = fs_dsd // D_cic
+
+            # --- 後段 FIR (Kaiser) の設計 ---
+            # 阻止帯域は PCM Nyquist 近辺で制限
+            max_stop = 0.45 * fs_pcm
+            stopband_hz = min(float(settings.stopband_hz), max_stop)
+            if stopband_hz <= 0.0:
+                stopband_hz = max_stop
+
+            fir_taps = design_kaiser_lowpass(
+                fs=float(fs_after_cic),
+                f_stop=stopband_hz,
+                attenuation_db=float(settings.stopband_atten_db),
+            ).astype(np.float32)
+
+            fir_state = create_fir_decimator_state(
+                num_channels=int(channels),
+                num_taps=len(fir_taps),
+                decim=int(D_fir),
+            )
+
+            # --- ストリーミング変換 ---
+            # DSD 側で 0.25 秒ぶんをまとめて処理（メモリとのバランスで調整可）
+            agg_duration_sec = 0.25
+            target_dsd_samples_per_ch = int(fs_dsd * agg_duration_sec)
+            if target_dsd_samples_per_ch <= 0:
+                target_dsd_samples_per_ch = reader.block_size_per_channel * 8
+
+            with sf.SoundFile(
+                dst,
+                mode="w",
+                samplerate=fs_pcm,
+                channels=channels,
+                format="FLAC",
+                subtype="PCM_24",
+            ) as out_f:
+                agg_blocks: list[np.ndarray] = []
+                agg_samples = 0
+
+                for dsd_block in reader.iter_blocks():
+                    if dsd_block.size == 0:
+                        continue
+                    if dsd_block.dtype != np.float32:
+                        dsd_block = dsd_block.astype(np.float32, copy=False)
+
+                    agg_blocks.append(dsd_block)
+                    agg_samples += dsd_block.shape[0]
+
+                    if agg_samples >= target_dsd_samples_per_ch:
+                        big_block = np.concatenate(agg_blocks, axis=0)
+
+                        # 初段 CIC
+                        x1 = process_block_cic_decimate(big_block, cic_state)
+                        if x1.size != 0:
+                            # 後段 FIR + decim
+                            pcm_block = process_block_fir_decimate(
+                                x1, fir_taps, fir_state, int(D_fir)
+                            )
+                            if pcm_block.size != 0:
+                                out_f.write(pcm_block.astype(np.float32))
+
+                        agg_blocks.clear()
+                        agg_samples = 0
+
+                # 端数を flush
+                if agg_blocks:
+                    big_block = np.concatenate(agg_blocks, axis=0)
+                    if big_block.dtype != np.float32:
+                        big_block = big_block.astype(np.float32, copy=False)
+
+                    x1 = process_block_cic_decimate(big_block, cic_state)
+                    if x1.size != 0:
+                        pcm_block = process_block_fir_decimate(
+                            x1, fir_taps, fir_state, int(D_fir)
+                        )
+                        if pcm_block.size != 0:
+                            out_f.write(pcm_block.astype(np.float32))
 
         finally:
             reader.close()

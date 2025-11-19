@@ -10,6 +10,27 @@ class FIRDecimatorState:
     prev_input: np.ndarray  # shape: (channels, taps-1)
     phase: np.ndarray       # shape: (channels,), modulo decim factor
 
+@dataclass
+class CICDecimatorState:
+    """CIC デシメータの状態（多チャンネル対応）。
+
+    order:
+        CIC の次数 (N)。典型値 3〜5。
+    decim:
+        デシメーション係数 R (例: 8, 16, 32)。
+    integrator:
+        shape = (channels, order), float64
+    comb:
+        shape = (channels, order), float64
+    phase:
+        shape = (1,), int64。ブロック跨ぎの位相 (0〜decim-1)
+    """
+    order: int
+    decim: int
+    integrator: np.ndarray
+    comb: np.ndarray
+    phase: np.ndarray  # shape=(1,)
+
 # dsp.py などのトップレベルに置く（Pickle 可能にするため）
 def fir_decimate_chunk_worker(
     dsd_ext: np.ndarray,
@@ -38,6 +59,27 @@ def create_fir_decimator_state(num_channels: int, num_taps: int, decim: int) -> 
     prev_input = np.zeros((num_channels, num_taps - 1), dtype=np.float32)
     phase = np.zeros(num_channels, dtype=np.int64)
     return FIRDecimatorState(prev_input=prev_input, phase=phase)
+
+def create_cic_decimator_state(num_channels: int, order: int, decim: int) -> CICDecimatorState:
+    if num_channels <= 0:
+        raise ValueError("num_channels must be positive.")
+    if order <= 0:
+        raise ValueError("CIC order must be positive.")
+    if decim <= 1:
+        raise ValueError("CIC decimation factor must be >= 2.")
+
+    integrator = np.zeros((num_channels, order), dtype=np.float64)
+    comb = np.zeros((num_channels, order), dtype=np.float64)
+    phase = np.zeros(1, dtype=np.int64)  # 共通位相
+
+    return CICDecimatorState(
+        order=int(order),
+        decim=int(decim),
+        integrator=integrator,
+        comb=comb,
+        phase=phase,
+    )
+
 
 def design_kaiser_lowpass(
     fs: float,
@@ -114,17 +156,79 @@ def design_kaiser_lowpass(
     h /= np.sum(h)
     return h.astype(np.float32)
 
-def create_fir_decimator_state(num_channels: int, num_taps: int, decim: int) -> FIRDecimatorState:
-    if num_channels <= 0:
-        raise ValueError("num_channels must be positive.")
-    if num_taps <= 1:
-        raise ValueError("num_taps must be > 1.")
-    if decim <= 0:
-        raise ValueError("decim must be positive.")
 
-    prev_input = np.zeros((num_channels, num_taps - 1), dtype=np.float32)
-    phase = np.zeros(num_channels, dtype=np.int64)
-    return FIRDecimatorState(prev_input=prev_input, phase=phase)
+@njit(cache=True, fastmath=True)
+def _process_block_cic_decimate_core(
+    dsd_block: np.ndarray,      # (samples, ch), float32
+    integrator: np.ndarray,     # (ch, order), float64
+    comb: np.ndarray,           # (ch, order), float64
+    phase_arr: np.ndarray,      # shape=(1,), int64
+    decim: int,
+    order: int,
+) -> np.ndarray:
+    """CIC デシメータ 1 ブロック処理（Numba コア）。
+
+    dsd_block:
+        入力 DSD サンプル（±1 を想定）。float32。
+    integrator, comb, phase_arr:
+        状態（in-place で更新）。
+    decim:
+        デシメーション係数 R。
+    order:
+        CIC 次数 N。
+    """
+    num_samples, num_channels = dsd_block.shape
+    p0 = int(phase_arr[0])
+
+    # 出力サンプル数の計算
+    # 出力条件: サンプル n (0-origin) の処理時に p == decim-1 だったとき
+    # p_n = (p0 + n) mod decim
+    # => p_n == decim-1 となる最小 n を求める
+    n0 = (decim - 1 - p0) % decim  # 最初に出力が出る n (>=0)
+    if n0 >= num_samples:
+        out_len = 0
+    else:
+        span = num_samples - 1 - n0
+        out_len = span // decim + 1
+
+    if out_len <= 0:
+        # phase だけ進めて終わり
+        phase_arr[0] = (p0 + num_samples) % decim
+        return np.empty((0, num_channels), dtype=np.float32)
+
+    y = np.empty((out_len, num_channels), dtype=np.float32)
+
+    p = p0
+    out_idx = 0
+
+    for n in range(num_samples):
+        # 各チャンネルでインテグレータを回す
+        for ch in range(num_channels):
+            v = float(dsd_block[n, ch])
+
+            # N 段インテグレータ
+            for s in range(order):
+                integrator[ch, s] += v
+                v = integrator[ch, s]
+
+            # デシメーション境界ならコンブを回して出力
+            if p == decim - 1:
+                w = v
+                for s in range(order):
+                    diff = w - comb[ch, s]
+                    comb[ch, s] = w
+                    w = diff
+                y[out_idx, ch] = float(w)
+
+        # 位相更新（サンプル共通）
+        if p == decim - 1:
+            out_idx += 1
+            p = 0
+        else:
+            p += 1
+
+    phase_arr[0] = p
+    return y
 
 
 @njit(cache=True, fastmath=True, parallel=True)
@@ -227,6 +331,44 @@ def fir_decimate_chunk_stateless(
         int(main_len),
     )
     return pcm
+
+def choose_cic_fir_decim_factors(total_decim: int, max_cic: int = 32) -> tuple[int, int]:
+    """総デシメーション total_decim を CIC + FIR に分解する。
+
+    Parameters
+    ----------
+    total_decim:
+        fs_in // fs_out の値（整数）。
+    max_cic:
+        CIC に割り当てる最大係数（2 の累乗を想定）。デフォルト 32。
+
+    Returns
+    -------
+    (D_cic, D_fir):
+        D_cic * D_fir = total_decim。
+        D_cic は power-of-two (<= max_cic) のうち最大のもの。
+        D_cic == 1 の場合は「CIC を使わず全部 FIR」という意味。
+    """
+    if total_decim <= 1:
+        return 1, 1
+
+    # total_decim が 2 の累乗でない場合もとりあえず最大の 2 の累乗因子で分解
+    D_cic = 1
+    # 候補（大きい順）
+    candidates = [32, 16, 8, 4, 2]
+    for r in candidates:
+        if r > max_cic:
+            continue
+        if total_decim % r == 0:
+            D_cic = r
+            break
+
+    if D_cic == 1:
+        return 1, total_decim
+
+    D_fir = total_decim // D_cic
+    return int(D_cic), int(D_fir)
+
 
 def process_dsd_in_chunks_stateless(
     dsd_iter,
@@ -338,3 +480,166 @@ def process_dsd_in_chunks_stateless(
             overlap=overlap,
         )
         yield pcm_chunk
+
+@njit(cache=True)
+def _process_block_fir_decimate_core(
+    dsd_block: np.ndarray,
+    taps: np.ndarray,
+    prev_input: np.ndarray,
+    phase: np.ndarray,
+    decim: int,
+) -> np.ndarray:
+    """
+    Numba 用のコア関数（ポリフェーズ FIR decimator）。
+    state は渡さず、prev_input/phase を直接受け取って in-place 更新する。
+    """
+    num_samples, num_channels = dsd_block.shape
+    num_taps = taps.shape[0]
+    prev_len = num_taps - 1
+    step = decim
+
+    # 各 ch の出力サンプル数を見ておき、最小値で揃える
+    n_out_min = num_samples
+    for ch in range(num_channels):
+        p = phase[ch]
+        if step > 0:
+            p_mod = p % step
+        else:
+            p_mod = p
+        first_idx = (step - p_mod) % step
+
+        if first_idx >= num_samples:
+            n_out = 0
+        else:
+            # first_idx, first_idx+step, ... < num_samples の個数
+            n_out = ((num_samples - 1 - first_idx) // step) + 1
+
+        if n_out < n_out_min:
+            n_out_min = n_out
+
+    if n_out_min < 0:
+        n_out_min = 0
+
+    # 出力バッファ
+    pcm_block = np.empty((n_out_min, num_channels), dtype=np.float64)
+
+    # 各チャンネルごとに処理
+    for ch in range(num_channels):
+        prev = prev_input[ch]
+        x_new = dsd_block[:, ch]
+
+        # extended = [prev, x_new] を作る
+        extended_len = prev_len + num_samples
+        extended = np.empty(extended_len, dtype=np.float64)
+
+        # 先頭に前回の末尾
+        for i in range(prev_len):
+            extended[i] = prev[i]
+        # 後ろに今回のブロック
+        for i in range(num_samples):
+            extended[prev_len + i] = x_new[i]
+
+        # decimation 位置を計算
+        p = phase[ch]
+        if step > 0:
+            p_mod = p % step
+        else:
+            p_mod = p
+        first_idx = (step - p_mod) % step
+
+        out_idx = 0
+        if n_out_min > 0:
+            j = first_idx
+            while j < num_samples and out_idx < n_out_min:
+                # y_valid[j] に相当する位置
+                j_base = j + prev_len
+
+                # ここで FIR の畳み込みを直接計算（ポリフェーズ）
+                acc = 0.0
+                for t in range(num_taps):
+                    acc += taps[t] * extended[j_base - t]
+
+                pcm_block[out_idx, ch] = acc
+                out_idx += 1
+                j += step
+
+        # 位相更新
+        phase[ch] = (p + num_samples) % step
+
+        # prev_input を更新 (拡張バッファの末尾 num_taps-1 サンプル)
+        if num_samples >= prev_len:
+            # ブロックが十分長い普通のケース
+            start = num_samples - prev_len
+            for i in range(prev_len):
+                prev_input[ch, i] = x_new[start + i]
+        else:
+            # ブロックがフィルタ長より短いレアケース
+            offset = prev_len - num_samples
+            # まず前回の末尾の一部をコピー
+            for i in range(offset):
+                prev_input[ch, i] = prev[i + prev_len - offset]
+            # 続けて今回ブロックをコピー
+            for i in range(num_samples):
+                prev_input[ch, offset + i] = x_new[i]
+
+    return pcm_block
+
+def process_block_fir_decimate(
+    dsd_block: np.ndarray,
+    taps: np.ndarray,
+    state: FIRDecimatorState,
+    decim: int,
+) -> np.ndarray:
+    ...
+    dsd_block64 = np.ascontiguousarray(dsd_block, dtype=np.float64)
+    taps64 = np.ascontiguousarray(taps, dtype=np.float64)
+
+    pcm_block = _process_block_fir_decimate_core(
+        dsd_block64,
+        taps64,
+        state.prev_input,
+        state.phase,
+        int(decim),
+    )
+
+    return pcm_block
+
+def process_block_cic_decimate(
+    dsd_block: np.ndarray,
+    state: CICDecimatorState,
+) -> np.ndarray:
+    """CIC デシメータで DSD ブロックを decimation する。
+
+    Parameters
+    ----------
+    dsd_block:
+        shape = (samples, channels), float32/float64。
+    state:
+        CICDecimatorState。order, decim, integrator, comb, phase を含む。
+
+    Returns
+    -------
+    y:
+        shape = (samples/decim, channels) 程度の float32。
+    """
+    if dsd_block.size == 0:
+        return np.empty((0, state.integrator.shape[0]), dtype=np.float32)
+
+    if dsd_block.ndim != 2:
+        raise ValueError("dsd_block must be 2D (samples, channels).")
+
+    num_samples, num_channels = dsd_block.shape
+    if num_channels != state.integrator.shape[0]:
+        raise ValueError("Channel count mismatch between dsd_block and CIC state.")
+
+    x32 = np.ascontiguousarray(dsd_block, dtype=np.float32)
+
+    y = _process_block_cic_decimate_core(
+        x32,
+        state.integrator,
+        state.comb,
+        state.phase,
+        int(state.decim),
+        int(state.order),
+    )
+    return y

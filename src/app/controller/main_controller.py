@@ -6,7 +6,12 @@ from typing import Dict
 
 from PySide6 import QtCore
 
-from ..model.converter import ConversionSettings, ConversionResult, convert_dsf_to_flac
+from ..model.converter import (
+    ConversionSettings,
+    ConversionResult,
+    convert_dsf_to_flac,
+    convert_dsf_to_flac_cic,
+)
 from ..model.dsf_reader import DsfReader
 from ..view.main_window import MainWindow
 
@@ -97,7 +102,7 @@ class ConversionController(QtCore.QObject):
             self.window.set_row_status(row, "変換待ち")
 
             # 変換をスケジュール
-            future = self._executor.submit(convert_dsf_to_flac, str(src_path), settings)
+            future = self._executor.submit(convert_dsf_to_flac_cic, str(src_path), settings)
             self._futures[future] = row
             self.window.set_row_status(row, "変換中")
 
