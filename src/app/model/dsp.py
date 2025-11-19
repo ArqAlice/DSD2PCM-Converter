@@ -35,7 +35,7 @@ def create_fir_decimator_state(num_channels: int, num_taps: int, decim: int) -> 
     if decim <= 0:
         raise ValueError("decim must be positive.")
 
-    prev_input = np.zeros((num_channels, num_taps - 1), dtype=np.float64)
+    prev_input = np.zeros((num_channels, num_taps - 1), dtype=np.float32)
     phase = np.zeros(num_channels, dtype=np.int64)
     return FIRDecimatorState(prev_input=prev_input, phase=phase)
 
@@ -122,7 +122,7 @@ def create_fir_decimator_state(num_channels: int, num_taps: int, decim: int) -> 
     if decim <= 0:
         raise ValueError("decim must be positive.")
 
-    prev_input = np.zeros((num_channels, num_taps - 1), dtype=np.float64)
+    prev_input = np.zeros((num_channels, num_taps - 1), dtype=np.float32)
     phase = np.zeros(num_channels, dtype=np.int64)
     return FIRDecimatorState(prev_input=prev_input, phase=phase)
 
@@ -286,9 +286,9 @@ def process_dsd_in_chunks_stateless(
             if tail is None:
                 # ファイル最初のチャンク：オーバーラップは 0 埋め
                 ch = main.shape[1]
-                tail = np.zeros((overlap, ch), dtype=np.float64)
+                tail = np.zeros((overlap, ch), dtype=np.float32)
             # dsd_ext = [tail; main]
-            dsd_ext = np.concatenate([tail, main.astype(np.float64)], axis=0)
+            dsd_ext = np.concatenate([tail, main.astype(np.float32)], axis=0)
 
             # このチャンク本体先頭のグローバル index
             g_start = global_index
@@ -312,7 +312,7 @@ def process_dsd_in_chunks_stateless(
                 # ここに来るのはほぼありえないが、保険
                 pad = overlap - concat_for_tail.shape[0]
                 ch = concat_for_tail.shape[1]
-                new_tail = np.zeros((overlap, ch), dtype=np.float64)
+                new_tail = np.zeros((overlap, ch), dtype=np.float32)
                 new_tail[pad:, :] = concat_for_tail
                 tail = new_tail
 
@@ -325,9 +325,9 @@ def process_dsd_in_chunks_stateless(
 
         if tail is None:
             ch = main.shape[1]
-            tail = np.zeros((overlap, ch), dtype=np.float64)
+            tail = np.zeros((overlap, ch), dtype=np.float32)
 
-        dsd_ext = np.concatenate([tail, main.astype(np.float64)], axis=0)
+        dsd_ext = np.concatenate([tail, main.astype(np.float32)], axis=0)
         g_start = global_index
 
         pcm_chunk = fir_decimate_chunk_stateless(
