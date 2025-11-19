@@ -74,7 +74,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.workers_label = QtWidgets.QLabel("同時変換数:")
         self.workers_spin = QtWidgets.QSpinBox()
         self.workers_spin.setRange(1, max(1, self._max_workers))
-        self.workers_spin.setValue(min(4, self._max_workers))
+        self.workers_spin.setValue(min(1, self._max_workers))
 
         # Start / Stop
         self.start_button = QtWidgets.QPushButton("変換開始")
