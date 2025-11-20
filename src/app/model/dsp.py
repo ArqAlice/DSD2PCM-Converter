@@ -180,6 +180,8 @@ def _process_block_cic_decimate_core(
     num_samples, num_channels = dsd_block.shape
     p0 = int(phase_arr[0])
 
+    gain_inv = 1.0 / (decim ** order)
+
     # 出力サンプル数の計算
     # 出力条件: サンプル n (0-origin) の処理時に p == decim-1 だったとき
     # p_n = (p0 + n) mod decim
@@ -218,7 +220,7 @@ def _process_block_cic_decimate_core(
                     diff = w - comb[ch, s]
                     comb[ch, s] = w
                     w = diff
-                y[out_idx, ch] = float(w)
+                y[out_idx, ch] = float(w * gain_inv)
 
         # 位相更新（サンプル共通）
         if p == decim - 1:
@@ -332,7 +334,7 @@ def fir_decimate_chunk_stateless(
     )
     return pcm
 
-def choose_cic_fir_decim_factors(total_decim: int, max_cic: int = 32) -> tuple[int, int]:
+def choose_cic_fir_decim_factors(total_decim: int, max_cic: int = 8) -> tuple[int, int]:
     """総デシメーション total_decim を CIC + FIR に分解する。
 
     Parameters
@@ -340,7 +342,7 @@ def choose_cic_fir_decim_factors(total_decim: int, max_cic: int = 32) -> tuple[i
     total_decim:
         fs_in // fs_out の値（整数）。
     max_cic:
-        CIC に割り当てる最大係数（2 の累乗を想定）。デフォルト 32。
+        CIC に割り当てる最大係数（2 の累乗を想定）。デフォルト 8。
 
     Returns
     -------
@@ -481,7 +483,7 @@ def process_dsd_in_chunks_stateless(
         )
         yield pcm_chunk
 
-@njit(cache=True)
+@njit(cache=True, fastmath=True)
 def _process_block_fir_decimate_core(
     dsd_block: np.ndarray,
     taps: np.ndarray,
@@ -500,7 +502,7 @@ def _process_block_fir_decimate_core(
 
     # 各 ch の出力サンプル数を見ておき、最小値で揃える
     n_out_min = num_samples
-    for ch in range(num_channels):
+    for ch in prange(num_channels):
         p = phase[ch]
         if step > 0:
             p_mod = p % step
@@ -521,16 +523,16 @@ def _process_block_fir_decimate_core(
         n_out_min = 0
 
     # 出力バッファ
-    pcm_block = np.empty((n_out_min, num_channels), dtype=np.float64)
+    pcm_block = np.empty((n_out_min, num_channels), dtype=np.float32)
 
     # 各チャンネルごとに処理
-    for ch in range(num_channels):
+    for ch in prange(num_channels):
         prev = prev_input[ch]
         x_new = dsd_block[:, ch]
 
         # extended = [prev, x_new] を作る
         extended_len = prev_len + num_samples
-        extended = np.empty(extended_len, dtype=np.float64)
+        extended = np.empty(extended_len, dtype=np.float32)
 
         # 先頭に前回の末尾
         for i in range(prev_len):
@@ -591,12 +593,12 @@ def process_block_fir_decimate(
     decim: int,
 ) -> np.ndarray:
     ...
-    dsd_block64 = np.ascontiguousarray(dsd_block, dtype=np.float64)
-    taps64 = np.ascontiguousarray(taps, dtype=np.float64)
+    dsd_block32 = np.ascontiguousarray(dsd_block, dtype=np.float32)
+    taps32 = np.ascontiguousarray(taps, dtype=np.float32)
 
     pcm_block = _process_block_fir_decimate_core(
-        dsd_block64,
-        taps64,
+        dsd_block32,
+        taps32,
         state.prev_input,
         state.phase,
         int(decim),

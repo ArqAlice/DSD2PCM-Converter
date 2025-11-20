@@ -310,7 +310,7 @@ def convert_dsf_to_flac_cic(
             total_decim = fs_dsd // fs_pcm
 
             # 総デシメーションを CIC + FIR に分割
-            D_cic, D_fir = choose_cic_fir_decim_factors(total_decim, max_cic=32)
+            D_cic, D_fir = choose_cic_fir_decim_factors(total_decim, max_cic=8)
 
             # 全部 FIR に任せる fallback
             if D_cic == 1:
