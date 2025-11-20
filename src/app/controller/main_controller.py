@@ -15,6 +15,7 @@ import concurrent.futures
 
 class ConversionController(QtCore.QObject):
     """GUI と変換ロジックをつなぐ Controller。"""
+    progress_changed = QtCore.Signal(int, float)  # row, progress(0.0〜1.0)
 
     def __init__(self, window: MainWindow, parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
@@ -32,6 +33,9 @@ class ConversionController(QtCore.QObject):
 
         # 行追加時に DSF の Fs / Ch を埋める
         self.window.table.model().rowsInserted.connect(self._on_rows_inserted)
+
+        # 進捗シグナルを View に接続
+        self.progress_changed.connect(self._on_progress_changed)
 
     # ------------------------------------------------------------------ #
     def _on_rows_inserted(self, parent_index, start: int, end: int) -> None:  # noqa: ANN001
@@ -96,11 +100,25 @@ class ConversionController(QtCore.QObject):
 
         for row, src_path in enumerate(file_paths):
             self.window.set_row_status(row, "変換待ち")
+            self.window.set_row_progress(row, 0.0)
 
-            # 変換をスケジュール
-            future = self._executor.submit(convert_dsf_to_flac, str(src_path), settings)
+            # row 固有の progress コールバックを作る
+            def make_progress_cb(row_index: int):
+                def _cb(frac: float) -> None:
+                    self.progress_changed.emit(row_index, frac)
+                return _cb
+
+            progress_cb = make_progress_cb(row)
+
+            # 変換をスケジュール（コールバック付き）
+            future = self._executor.submit(
+                convert_dsf_to_flac,
+                str(src_path),
+                settings,
+                progress_cb,
+            )
             self._futures[future] = row
-            self.window.set_row_status(row, "変換中")
+            self.window.set_row_status(row, "変換中 0%")
 
         self.window.set_conversion_running(True)
         self._poll_timer.start()
@@ -144,11 +162,13 @@ class ConversionController(QtCore.QObject):
                 if result.dst_path is not None:
                     self.window.set_row_output_path(row, result.dst_path)
                 self.window.append_log(f"[OK] {result.src_path} -> {result.dst_path}")
+                self.window.set_row_progress(row, 1.0)
                 if result.message and result.message != "OK":
                     self.window.append_log(f"  メモ: {result.message}")
             else:
                 self.window.set_row_status(row, "エラー")
                 self.window.append_log(f"[NG] {result.src_path}: {result.message}")
+                self.window.set_row_progress(row, 0.0)
 
         if not self._futures:
             # すべて完了
@@ -161,3 +181,18 @@ class ConversionController(QtCore.QObject):
             self._executor = None
             self.window.set_conversion_running(False)
             self.window.append_log("すべての変換が完了しました。")
+    
+    @QtCore.Slot(int, float)
+    def _on_progress_changed(self, row: int, frac: float) -> None:
+        # 0.0〜1.0 → 0〜100%
+        percent = int(frac * 100.0)
+        if percent < 0:
+            percent = 0
+        elif percent > 100:
+            percent = 100
+
+        # ステータスを「変換中 XX%」に上書き
+        self.window.set_row_status(row, f"変換中 {percent}%")
+
+        # プログレスバーを更新
+        self.window.set_row_progress(row, frac)
