@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import os
-import concurrent.futures
 
 import numpy as np
 import soundfile as sf
@@ -28,26 +27,6 @@ class ConversionResult:
     dst_path: Path | None
     message: str
 
-
-def fir_decimate_chunk_worker(
-    dsd_ext: np.ndarray,
-    taps: np.ndarray,
-    decim: int,
-    global_start_index: int,
-) -> np.ndarray:
-    """マルチプロセス用のワーカー関数。
-
-    1 チャンク分の DSD (オーバーラップ付き) に対して FIR+デシメーションを行い、
-    このチャンク本体に対応する PCM ブロックを返す。
-    """
-    overlap = len(taps) - 1
-    return fir_decimate_chunk_stateless(
-        dsd_ext,
-        taps,
-        decim,
-        global_start_index=global_start_index,
-        overlap=overlap,
-    )
 
 def convert_dsf_to_flac(
     src_path: str | Path,
@@ -113,13 +92,6 @@ def convert_dsf_to_flac(
             if chunk_dsd_samples <= overlap:
                 chunk_dsd_samples = overlap * 2
 
-            # 内部並列度（必要に応じて調整）
-            cpu_cnt = os.cpu_count() or 1
-            inner_workers = max(1, cpu_cnt // 2)
-
-            # in-flight チャンク数の上限
-            max_inflight_chunks = inner_workers * 2
-
             with sf.SoundFile(
                 dst,
                 mode="w",
@@ -127,35 +99,7 @@ def convert_dsf_to_flac(
                 channels=channels,
                 format="FLAC",
                 subtype="PCM_24",
-            ) as out_f, concurrent.futures.ProcessPoolExecutor(
-                max_workers=inner_workers,
-            ) as pool:
-
-                # in-flight 管理用
-                inflight: dict[int, concurrent.futures.Future] = {}
-                next_to_write = 0
-                chunk_index = 0
-
-                def flush_completed(bound: bool) -> None:
-                    """順序を保ちながら、書けるチャンクを out_f に書き出す。
-
-                    bound=True のときは「inflight が max_inflight を切るまで」
-                    を目安にループを途中で抜ける。
-                    bound=False のときは inflight が空になるまで書き切る。
-                    """
-                    nonlocal next_to_write
-                    while True:
-                        if next_to_write not in inflight:
-                            break
-                        fut = inflight.pop(next_to_write)
-                        pcm_block = fut.result()
-                        if pcm_block.size != 0:
-                            # 既に float32 なのでそのまま書く
-                            out_f.write(pcm_block)
-                        next_to_write += 1
-
-                        if bound and len(inflight) < max_inflight_chunks:
-                            break
+            ) as out_f:
 
                 # 直前までの末尾 overlap サンプル（float32）
                 tail = np.zeros((overlap, channels), dtype=np.float32)
@@ -166,7 +110,7 @@ def convert_dsf_to_flac(
                 agg_blocks: list[np.ndarray] = []
                 agg_count = 0
 
-                # DSD ブロックを読みながらチャンク分割してワーカーに投げる
+                # DSD ブロックを読みながらチャンク分割して、その場で FIR+decimate する
                 for blk in reader.iter_blocks():
                     if blk.size == 0:
                         continue
@@ -176,6 +120,7 @@ def convert_dsf_to_flac(
                     agg_blocks.append(blk)
                     agg_count += blk.shape[0]
 
+                    # まとめた DSD サンプル数がチャンクしきい値を超えたら処理
                     while agg_count >= chunk_dsd_samples:
                         big = np.concatenate(agg_blocks, axis=0)
                         main = big[:chunk_dsd_samples, :]
@@ -189,24 +134,18 @@ def convert_dsf_to_flac(
                             np.float32, copy=False
                         )
 
-                        g_start = global_index  # 本体先頭の global index
-
-                        # 新しいチャンクをサブワーカーに submit
-                        fut = pool.submit(
-                            fir_decimate_chunk_worker,
+                        # このチャンク本体に対応する PCM を計算（Numba 内で並列実行）
+                        pcm_block = fir_decimate_chunk_stateless(
                             dsd_ext,
                             taps,
                             decim,
-                            g_start,
+                            global_start_index=global_index,
+                            overlap=overlap,
                         )
-                        inflight[chunk_index] = fut
-                        chunk_index += 1
+                        if pcm_block.size != 0:
+                            out_f.write(pcm_block)
 
-                        # in-flight が増えすぎないように適宜フラッシュ
-                        if len(inflight) >= max_inflight_chunks:
-                            flush_completed(bound=True)
-
-                        # tail 更新
+                        # tail 更新（次チャンク用）
                         concat_for_tail = np.concatenate([tail, main], axis=0)
                         if concat_for_tail.shape[0] >= overlap:
                             tail = concat_for_tail[-overlap:, :].astype(
@@ -224,26 +163,21 @@ def convert_dsf_to_flac(
 
                         global_index += main.shape[0]
 
-                # 余りチャンクがあれば最後の 1 個を submit
+                # 余りチャンクがあれば最後に処理
                 if agg_count > 0:
                     big = np.concatenate(agg_blocks, axis=0)
                     main = big.astype(np.float32, copy=False)
 
                     dsd_ext = np.concatenate([tail, main], axis=0)
-                    g_start = global_index
-
-                    fut = pool.submit(
-                        fir_decimate_chunk_worker,
+                    pcm_block = fir_decimate_chunk_stateless(
                         dsd_ext,
                         taps,
                         decim,
-                        g_start,
+                        global_start_index=global_index,
+                        overlap=overlap,
                     )
-                    inflight[chunk_index] = fut
-                    chunk_index += 1
-
-                # すべての in-flight チャンクを書き切る
-                flush_completed(bound=False)
+                    if pcm_block.size != 0:
+                        out_f.write(pcm_block)
 
         finally:
             reader.close()

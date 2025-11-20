@@ -181,16 +181,15 @@ def _fir_decimate_chunk_core(
 
     pcm = np.empty((n_out, num_channels), dtype=np.float32)
 
-    # チャンネル方向を prange で並列化
-    for ch in prange(num_channels):
-        n = n_first
-        for i in range(n_out):
+    # ★ ここがポイント：出力サンプル方向に並列化する
+    for i in prange(n_out):
+        n = n_first + i * decim
+        for ch in range(num_channels):
             acc = np.float32(0.0)
             # y[n] = Σ h[k] * x[n-k]
             for k in range(L):
                 acc += taps[k] * dsd_ext[n - k, ch]
             pcm[i, ch] = acc
-            n += decim
 
     return pcm
 
