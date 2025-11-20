@@ -129,17 +129,30 @@ def create_fir_decimator_state(num_channels: int, num_taps: int, decim: int) -> 
 
 @njit(cache=True, fastmath=True, parallel=True)
 def _fir_decimate_chunk_core(
-    dsd_ext: np.ndarray,      # shape = (N_ext, ch), float32
-    taps: np.ndarray,         # shape = (L,), float32
+    dsd_ext_cf: np.ndarray,    # shape = (channels, N_ext), float32
+    taps: np.ndarray,          # shape = (L,), float32
     decim: int,
-    phase_init: int,          # dsd_ext[0] の global index % decim
-    overlap: int,             # 通常 L-1
-    main_len: int,            # 本体サンプル数
+    phase_init: int,           # dsd_ext[0] に対応する global index % decim
+    overlap: int,              # 通常 L-1
+    main_len: int,             # 本体サンプル数
 ) -> np.ndarray:
     """
-    float32 前提の高速版: 出力位置 n を解析的に求めてから、その位置だけ FIR 畳み込みする。
+    float32 前提の高速版 (channels-first)。
+
+    dsd_ext_cf:
+        shape = (channels, N_ext)。先頭 overlap サンプルは前チャンクとのオーバーラップ。
+    taps:
+        FIR 係数。
+    decim:
+        デシメーション係数。
+    phase_init:
+        dsd_ext_cf[:, overlap] に対応する DSD グローバル index % decim。
+    overlap:
+        オーバーラップサンプル数。通常 len(taps)-1。
+    main_len:
+        このチャンクで本体として処理する DSD サンプル数。
     """
-    num_samples, num_channels = dsd_ext.shape
+    num_channels, num_samples = dsd_ext_cf.shape
     L = taps.shape[0]
 
     if num_samples != overlap + main_len:
@@ -181,17 +194,19 @@ def _fir_decimate_chunk_core(
 
     pcm = np.empty((n_out, num_channels), dtype=np.float32)
 
-    # ★ ここがポイント：出力サンプル方向に並列化する
+    # ★ 出力サンプル方向に並列化
     for i in prange(n_out):
         n = n_first + i * decim
         for ch in range(num_channels):
+            x = dsd_ext_cf[ch]  # shape = (N_ext,), contiguous
             acc = np.float32(0.0)
             # y[n] = Σ h[k] * x[n-k]
             for k in range(L):
-                acc += taps[k] * dsd_ext[n - k, ch]
+                acc += taps[k] * x[n - k]
             pcm[i, ch] = acc
 
     return pcm
+
 
 def fir_decimate_chunk_stateless(
     dsd_ext: np.ndarray,
@@ -200,25 +215,30 @@ def fir_decimate_chunk_stateless(
     global_start_index: int,
     overlap: int,
 ) -> np.ndarray:
-    """stateless な 1 チャンク用 FIR+decimator（float32版）。"""
+    """stateless な 1 チャンク用 FIR+decimator（float32, channels-first版）。"""
+    # 入力は (N_ext, ch) 前提。float32＋C連続に整えておく。
     dsd_ext32 = np.ascontiguousarray(dsd_ext, dtype=np.float32)
-    taps32 = np.ascontiguousarray(taps, dtype=np.float32)
 
-    num_samples, _ = dsd_ext32.shape
+    num_samples, num_channels = dsd_ext32.shape
     main_len = num_samples - overlap
     if main_len <= 0:
-        return np.empty((0, dsd_ext32.shape[1]), dtype=np.float32)
+        return np.empty((0, num_channels), dtype=np.float32)
 
-    L = taps32.shape[0]
+    L = taps.shape[0]
     if overlap < L - 1:
         raise ValueError("overlap must be at least L-1 for seamless processing.")
+
+    # channels-first に 1 回だけ転置して contiguous にする
+    dsd_ext_cf = np.ascontiguousarray(dsd_ext32.T)  # shape = (ch, N_ext)
+
+    taps32 = np.ascontiguousarray(taps, dtype=np.float32)
 
     # dsd_ext[0] に対応する global index
     ext_start_index = global_start_index - overlap
     phase_init = ext_start_index % decim
 
     pcm = _fir_decimate_chunk_core(
-        dsd_ext32,
+        dsd_ext_cf,
         taps32,
         int(decim),
         int(phase_init),

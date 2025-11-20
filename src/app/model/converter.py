@@ -82,10 +82,10 @@ def convert_dsf_to_flac(
             #   ・ただし DSD256 のような高 Fs では、チャンクのバイト数が
             #     16MB を超えないように制限
             # -----------------------------
-            target_chunk_bytes = 16 * 1024 * 1024  # 16MB くらいを目安
+            target_chunk_bytes = 64 * 1024 * 1024  # 64MB くらいを目安
             bytes_per_sample = 4 * channels       # float32 × channels
 
-            chunk_dsd_samples_time = int(fs_dsd * 0.25)  # 0.25 秒
+            chunk_dsd_samples_time = int(fs_dsd * 1.0)  # 1.0 秒
             chunk_dsd_samples_mem = target_chunk_bytes // bytes_per_sample
 
             chunk_dsd_samples = min(chunk_dsd_samples_time, chunk_dsd_samples_mem)
