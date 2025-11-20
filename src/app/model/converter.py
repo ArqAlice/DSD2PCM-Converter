@@ -15,6 +15,7 @@ from .dsp import (
     process_block_fir_decimate,
     create_cic_decimator_state,
     process_block_cic_decimate,
+    fir_decimate_chunk_stateless,
     choose_cic_fir_decim_factors,
 )
 from .tagging import copy_tags_dsf_to_flac

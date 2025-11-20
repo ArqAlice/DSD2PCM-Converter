@@ -157,82 +157,6 @@ def design_kaiser_lowpass(
     return h.astype(np.float32)
 
 
-@njit(cache=True, fastmath=True)
-def _process_block_cic_decimate_core(
-    dsd_block: np.ndarray,      # (samples, ch), float32
-    integrator: np.ndarray,     # (ch, order), float64
-    comb: np.ndarray,           # (ch, order), float64
-    phase_arr: np.ndarray,      # shape=(1,), int64
-    decim: int,
-    order: int,
-) -> np.ndarray:
-    """CIC デシメータ 1 ブロック処理（Numba コア）。
-
-    dsd_block:
-        入力 DSD サンプル（±1 を想定）。float32。
-    integrator, comb, phase_arr:
-        状態（in-place で更新）。
-    decim:
-        デシメーション係数 R。
-    order:
-        CIC 次数 N。
-    """
-    num_samples, num_channels = dsd_block.shape
-    p0 = int(phase_arr[0])
-
-    gain_inv = 1.0 / (decim ** order)
-
-    # 出力サンプル数の計算
-    # 出力条件: サンプル n (0-origin) の処理時に p == decim-1 だったとき
-    # p_n = (p0 + n) mod decim
-    # => p_n == decim-1 となる最小 n を求める
-    n0 = (decim - 1 - p0) % decim  # 最初に出力が出る n (>=0)
-    if n0 >= num_samples:
-        out_len = 0
-    else:
-        span = num_samples - 1 - n0
-        out_len = span // decim + 1
-
-    if out_len <= 0:
-        # phase だけ進めて終わり
-        phase_arr[0] = (p0 + num_samples) % decim
-        return np.empty((0, num_channels), dtype=np.float32)
-
-    y = np.empty((out_len, num_channels), dtype=np.float32)
-
-    p = p0
-    out_idx = 0
-
-    for n in range(num_samples):
-        # 各チャンネルでインテグレータを回す
-        for ch in range(num_channels):
-            v = float(dsd_block[n, ch])
-
-            # N 段インテグレータ
-            for s in range(order):
-                integrator[ch, s] += v
-                v = integrator[ch, s]
-
-            # デシメーション境界ならコンブを回して出力
-            if p == decim - 1:
-                w = v
-                for s in range(order):
-                    diff = w - comb[ch, s]
-                    comb[ch, s] = w
-                    w = diff
-                y[out_idx, ch] = float(w * gain_inv)
-
-        # 位相更新（サンプル共通）
-        if p == decim - 1:
-            out_idx += 1
-            p = 0
-        else:
-            p += 1
-
-    phase_arr[0] = p
-    return y
-
-
 @njit(cache=True, fastmath=True, parallel=True)
 def _fir_decimate_chunk_core(
     dsd_ext: np.ndarray,      # shape = (N_ext, ch), float32
@@ -585,6 +509,81 @@ def _process_block_fir_decimate_core(
                 prev_input[ch, offset + i] = x_new[i]
 
     return pcm_block
+
+@njit(cache=True)
+def _process_block_cic_decimate_core(
+    dsd_block: np.ndarray,      # (samples, ch), float32
+    integrator: np.ndarray,     # (ch, order), float64
+    comb: np.ndarray,           # (ch, order), float64
+    phase_arr: np.ndarray,      # shape=(1,), int64
+    decim: int,
+    order: int,
+) -> np.ndarray:
+    """CIC デシメータ 1 ブロック処理（Numba コア）。
+
+    dsd_block:
+        入力 DSD サンプル（±1 を想定）。float32。
+    integrator, comb, phase_arr:
+        状態（in-place で更新）。
+    decim:
+        デシメーション係数 R。
+    order:
+        CIC 次数 N。
+    """
+    num_samples, num_channels = dsd_block.shape
+    p0 = int(phase_arr[0])
+
+    gain_inv = 1.0 / (decim ** order)
+
+    # 出力サンプル数の計算
+    # 出力条件: サンプル n (0-origin) の処理時に p == decim-1 だったとき
+    # p_n = (p0 + n) mod decim
+    # => p_n == decim-1 となる最小 n を求める
+    n0 = (decim - 1 - p0) % decim  # 最初に出力が出る n (>=0)
+    if n0 >= num_samples:
+        out_len = 0
+    else:
+        span = num_samples - 1 - n0
+        out_len = span // decim + 1
+
+    if out_len <= 0:
+        # phase だけ進めて終わり
+        phase_arr[0] = (p0 + num_samples) % decim
+        return np.empty((0, num_channels), dtype=np.float32)
+
+    y = np.empty((out_len, num_channels), dtype=np.float64)
+
+    p = p0
+    out_idx = 0
+
+    for n in range(num_samples):
+        # 各チャンネルでインテグレータを回す
+        for ch in range(num_channels):
+            v = float(dsd_block[n, ch])
+
+            # N 段インテグレータ
+            for s in range(order):
+                integrator[ch, s] += v
+                v = integrator[ch, s]
+
+            # デシメーション境界ならコンブを回して出力
+            if p == decim - 1:
+                w = v
+                for s in range(order):
+                    diff = w - comb[ch, s]
+                    comb[ch, s] = w
+                    w = diff
+                y[out_idx, ch] = float(w * gain_inv)
+
+        # 位相更新（サンプル共通）
+        if p == decim - 1:
+            out_idx += 1
+            p = 0
+        else:
+            p += 1
+
+    phase_arr[0] = p
+    return y.astype(np.float32)
 
 def process_block_fir_decimate(
     dsd_block: np.ndarray,
