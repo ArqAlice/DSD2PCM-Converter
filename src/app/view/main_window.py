@@ -30,9 +30,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.clear_files_button = QtWidgets.QPushButton("一覧をクリア")
 
         # ファイル一覧テーブル
-        self.table = QtWidgets.QTableWidget(0, 5, self)
+        self.table = QtWidgets.QTableWidget(0, 6, self)
         self.table.setHorizontalHeaderLabels(
-            ["入力ファイル", "出力ファイル", "DSD Fs [Hz]", "Ch", "ステータス"]
+            ["入力ファイル", "出力ファイル", "DSD Fs [Hz]", "Ch", "ステータス", "進捗"]
         )
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
@@ -40,6 +40,7 @@ class MainWindow(QtWidgets.QMainWindow):
         header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -68,13 +69,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.atten_spin.setDecimals(1)
         self.atten_spin.setRange(40.0, 200.0)
         self.atten_spin.setSingleStep(5.0)
-        self.atten_spin.setValue(140.0)
+        self.atten_spin.setValue(145.0)
 
         # 同時変換数
         self.workers_label = QtWidgets.QLabel("同時変換数:")
         self.workers_spin = QtWidgets.QSpinBox()
         self.workers_spin.setRange(1, max(1, self._max_workers))
-        self.workers_spin.setValue(min(2, self._max_workers))
+        self.workers_spin.setValue(min(1, self._max_workers))
 
         # Start / Stop
         self.start_button = QtWidgets.QPushButton("変換開始")
@@ -184,6 +185,19 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 item.setText(status)
 
+    def set_row_progress(self, row: int, frac: float) -> None:
+        """0.0〜1.0 の進捗をパーセント表示に反映する。"""
+        if 0 <= row < self.table.rowCount():
+            widget = self.table.cellWidget(row, 5)
+            if not isinstance(widget, QtWidgets.QProgressBar):
+                bar = QtWidgets.QProgressBar()
+                bar.setRange(0, 100)
+                bar.setTextVisible(False)
+                self.table.setCellWidget(row, 5, bar)
+                widget = bar
+            value = max(0, min(100, int(frac * 100.0)))
+            widget.setValue(value)
+
     def set_row_dsd_info(self, row: int, fs: int, channels: int) -> None:
         if 0 <= row < self.table.rowCount():
             fs_item = QtWidgets.QTableWidgetItem(str(fs))
@@ -220,6 +234,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.table.insertRow(row)
             self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(path)))
             self.set_row_status(row, "待機中")
+
+        # ★ 進捗バーを仕込む
+        bar = QtWidgets.QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setTextVisible(False)
+        self.table.setCellWidget(row, 5, bar)
 
     def _on_remove_files_clicked(self) -> None:
         rows = self.get_selected_rows()

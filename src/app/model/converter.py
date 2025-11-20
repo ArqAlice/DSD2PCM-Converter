@@ -6,6 +6,7 @@ import os
 
 import numpy as np
 import soundfile as sf
+from typing import Callable, Optional
 from concurrent.futures import ThreadPoolExecutor, Future
 
 from .dsf_reader import DsfReader
@@ -33,6 +34,7 @@ class ConversionResult:
 def convert_dsf_to_flac(
     src_path: str | Path,
     settings: ConversionSettings,
+    progress_cb: Callable[[float], None] | None = None,
 ) -> ConversionResult:
     src = Path(src_path)
     try:
@@ -47,6 +49,10 @@ def convert_dsf_to_flac(
         try:
             fs_dsd = reader.sample_rate
             channels = reader.channels
+            total_samples = reader.sample_count
+
+            if progress_cb is not None:
+                progress_cb(0.0)
 
             fs_pcm = int(settings.pcm_samplerate)
             if fs_pcm <= 0:
@@ -114,6 +120,9 @@ def convert_dsf_to_flac(
                 agg_blocks: list[np.ndarray] = []
                 agg_count = 0
 
+                # 進捗表示用
+                processed_samples = 0  # 変換完了したDSD サンプル数（per channel）
+
                 # チャンク ID と書き出し順管理
                 next_chunk_id = 0       # 次に submit するチャンクの ID
                 next_write_id = 0       # 次に out_f に書き出すべきチャンク ID
@@ -174,9 +183,16 @@ def convert_dsf_to_flac(
                     if blk.dtype != np.float32:
                         blk = blk.astype(np.float32, copy=False)
 
+                    # 「読み終わった DSD サンプル数」を加算（進捗表示用）
+                    processed_samples += blk.shape[0]
+                    if progress_cb is not None and total_samples > 0:
+                        frac = min(processed_samples / float(total_samples), 0.9999)
+                        progress_cb(frac)
+
                     agg_blocks.append(blk)
                     agg_count += blk.shape[0]
 
+                    # まとめた DSD サンプル数がチャンクしきい値を超えたら処理
                     while agg_count >= chunk_dsd_samples:
                         # チャンク本体を取り出す
                         big = np.concatenate(agg_blocks, axis=0)
@@ -186,7 +202,7 @@ def convert_dsf_to_flac(
                         agg_blocks = [rest] if rest.size > 0 else []
                         agg_count = rest.shape[0] if rest.size > 0 else 0
 
-                        # ★ このチャンクをスレッドプールに投げる
+                        # このチャンクをスレッドプールに投げる
                         submit_chunk(main, tail, global_index)
 
                         # tail 更新（次チャンク用）: ここは入力 DSD だけで決まるので
@@ -202,7 +218,7 @@ def convert_dsf_to_flac(
 
                         global_index += main.shape[0]
 
-                        # ★ 溜めすぎ防止: pending が多くなったら少し捌く
+                        # 溜めすぎ防止: pending が多くなったら少し捌く
                         if len(pending) >= 2 * (settings.max_workers):
                             drain_completed(block=True)  # 少なくとも一つは書き出す
 
@@ -216,8 +232,12 @@ def convert_dsf_to_flac(
                     main = big.astype(np.float32, copy=False)
 
                     submit_chunk(main, tail, global_index)
+                
+                # すべての DSD を処理し終わったので、最終進捗を 1.0 に
+                if progress_cb is not None:
+                    progress_cb(1.0)
 
-                # ★ すべてのチャンクが終わるまで待って順番に書き出す
+                # すべてのチャンクが終わるまで待って順番に書き出す
                 drain_completed(block=True)
                 # （executor は with ブロックを抜けると自動で shutdown(wait=True)）
 
