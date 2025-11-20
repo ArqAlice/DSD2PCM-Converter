@@ -5,8 +5,8 @@ import sys
 
 from PySide6 import QtWidgets
 
-from app.controller.main_controller import ConversionController
-from app.view.main_window import MainWindow
+from .controller.main_controller import ConversionController
+from .view.main_window import MainWindow
 
 
 def main() -> int:

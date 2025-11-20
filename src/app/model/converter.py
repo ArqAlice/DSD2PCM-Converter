@@ -6,6 +6,7 @@ import os
 
 import numpy as np
 import soundfile as sf
+from concurrent.futures import ThreadPoolExecutor, Future
 
 from .dsf_reader import DsfReader
 from .dsp import design_kaiser_lowpass, fir_decimate_chunk_stateless
@@ -18,6 +19,7 @@ class ConversionSettings:
     pcm_samplerate: int
     stopband_hz: float
     stopband_atten_db: float
+    max_workers : int
 
 
 @dataclass(frozen=True)
@@ -78,14 +80,14 @@ def convert_dsf_to_flac(
 
             # -----------------------------
             # チャンクサイズを動的に決める
-            #   ・基本は 0.25 秒
+            #   ・基本は 0.5 秒
             #   ・ただし DSD256 のような高 Fs では、チャンクのバイト数が
-            #     16MB を超えないように制限
+            #     32MB を超えないように制限
             # -----------------------------
-            target_chunk_bytes = 64 * 1024 * 1024  # 64MB くらいを目安
+            target_chunk_bytes = 32 * 1024 * 1024  # 32MB くらいを目安
             bytes_per_sample = 4 * channels       # float32 × channels
 
-            chunk_dsd_samples_time = int(fs_dsd * 1.0)  # 1.0 秒
+            chunk_dsd_samples_time = int(fs_dsd * 0.5)  # 0.5 秒
             chunk_dsd_samples_mem = target_chunk_bytes // bytes_per_sample
 
             chunk_dsd_samples = min(chunk_dsd_samples_time, chunk_dsd_samples_mem)
@@ -99,7 +101,9 @@ def convert_dsf_to_flac(
                 channels=channels,
                 format="FLAC",
                 subtype="PCM_24",
-            ) as out_f:
+            ) as out_f, ThreadPoolExecutor(
+                max_workers= settings.max_workers
+            ) as executor:
 
                 # 直前までの末尾 overlap サンプル（float32）
                 tail = np.zeros((overlap, channels), dtype=np.float32)
@@ -109,6 +113,59 @@ def convert_dsf_to_flac(
 
                 agg_blocks: list[np.ndarray] = []
                 agg_count = 0
+
+                # チャンク ID と書き出し順管理
+                next_chunk_id = 0       # 次に submit するチャンクの ID
+                next_write_id = 0       # 次に out_f に書き出すべきチャンク ID
+                pending: dict[int, Future[np.ndarray]] = {}
+
+                def submit_chunk(main: np.ndarray, tail_arr: np.ndarray, g_start: int) -> None:
+                    nonlocal next_chunk_id
+                    chunk_id = next_chunk_id
+                    next_chunk_id += 1
+
+                    # [tail; main] を作成
+                    dsd_ext = np.concatenate([tail_arr, main], axis=0).astype(
+                        np.float32, copy=False
+                    )
+
+                    fut: Future[np.ndarray] = executor.submit(
+                        fir_decimate_chunk_stateless,
+                        dsd_ext,
+                        taps,
+                        decim,
+                        g_start,
+                        overlap,
+                    )
+                    pending[chunk_id] = fut
+
+                def drain_completed(block: bool = False) -> None:
+                    """
+                    chunk_id の昇順で、完了済みのチャンクを out_f に書き出す。
+
+                    block=False: すぐ終わらないものは飛ばす（軽く流す）
+                    block=True : next_write_id が完了するまで（または pending が空になるまで）待つ
+                    """
+                    nonlocal next_write_id
+
+                    while True:
+                        fut = pending.get(next_write_id)
+                        if fut is None:
+                            return
+
+                        if not fut.done():
+                            if not block:
+                                return
+                            # block=True の場合はここで待つ
+                            pcm_block = fut.result()
+                        else:
+                            pcm_block = fut.result()
+
+                        if pcm_block.size != 0:
+                            out_f.write(pcm_block)
+
+                        del pending[next_write_id]
+                        next_write_id += 1
 
                 # DSD ブロックを読みながらチャンク分割して、その場で FIR+decimate する
                 for blk in reader.iter_blocks():
@@ -120,8 +177,8 @@ def convert_dsf_to_flac(
                     agg_blocks.append(blk)
                     agg_count += blk.shape[0]
 
-                    # まとめた DSD サンプル数がチャンクしきい値を超えたら処理
                     while agg_count >= chunk_dsd_samples:
+                        # チャンク本体を取り出す
                         big = np.concatenate(agg_blocks, axis=0)
                         main = big[:chunk_dsd_samples, :]
                         rest = big[chunk_dsd_samples:, :]
@@ -129,55 +186,40 @@ def convert_dsf_to_flac(
                         agg_blocks = [rest] if rest.size > 0 else []
                         agg_count = rest.shape[0] if rest.size > 0 else 0
 
-                        # [tail; main] を作成
-                        dsd_ext = np.concatenate([tail, main], axis=0).astype(
-                            np.float32, copy=False
-                        )
+                        # ★ このチャンクをスレッドプールに投げる
+                        submit_chunk(main, tail, global_index)
 
-                        # このチャンク本体に対応する PCM を計算（Numba 内で並列実行）
-                        pcm_block = fir_decimate_chunk_stateless(
-                            dsd_ext,
-                            taps,
-                            decim,
-                            global_start_index=global_index,
-                            overlap=overlap,
-                        )
-                        if pcm_block.size != 0:
-                            out_f.write(pcm_block)
-
-                        # tail 更新（次チャンク用）
+                        # tail 更新（次チャンク用）: ここは入力 DSD だけで決まるので
+                        # 計算結果は待たなくてよい
                         concat_for_tail = np.concatenate([tail, main], axis=0)
                         if concat_for_tail.shape[0] >= overlap:
-                            tail = concat_for_tail[-overlap:, :].astype(
-                                np.float32, copy=False
-                            )
+                            tail = concat_for_tail[-overlap:, :].astype(np.float32, copy=False)
                         else:
                             pad = overlap - concat_for_tail.shape[0]
-                            new_tail = np.zeros(
-                                (overlap, channels), dtype=np.float32
-                            )
-                            new_tail[pad:, :] = concat_for_tail.astype(
-                                np.float32, copy=False
-                            )
+                            new_tail = np.zeros((overlap, channels), dtype=np.float32)
+                            new_tail[pad:, :] = concat_for_tail.astype(np.float32, copy=False)
                             tail = new_tail
 
                         global_index += main.shape[0]
 
-                # 余りチャンクがあれば最後に処理
+                        # ★ 溜めすぎ防止: pending が多くなったら少し捌く
+                        if len(pending) >= 2 * (settings.max_workers):
+                            drain_completed(block=True)  # 少なくとも一つは書き出す
+
+                        else:
+                            # 軽く流す（完了済みがあれば書き出す）
+                            drain_completed(block=False)
+
+                # 余りチャンクがあれば最後に処理（これもスレッドプールに投げる）
                 if agg_count > 0:
                     big = np.concatenate(agg_blocks, axis=0)
                     main = big.astype(np.float32, copy=False)
 
-                    dsd_ext = np.concatenate([tail, main], axis=0)
-                    pcm_block = fir_decimate_chunk_stateless(
-                        dsd_ext,
-                        taps,
-                        decim,
-                        global_start_index=global_index,
-                        overlap=overlap,
-                    )
-                    if pcm_block.size != 0:
-                        out_f.write(pcm_block)
+                    submit_chunk(main, tail, global_index)
+
+                # ★ すべてのチャンクが終わるまで待って順番に書き出す
+                drain_completed(block=True)
+                # （executor は with ブロックを抜けると自動で shutdown(wait=True)）
 
         finally:
             reader.close()

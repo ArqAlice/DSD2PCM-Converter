@@ -32,6 +32,9 @@ MANIFEST
 *.manifest
 *.spec
 
+# Nuitka
+nuitka-crash-report.xml
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
@@ -107,8 +110,6 @@ ipython_config.py
 #   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
 #poetry.lock
 #poetry.toml
-
-.vscode
 
 # pdm
 #   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.

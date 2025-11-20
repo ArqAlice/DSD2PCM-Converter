@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import numpy as np
-from numba import njit, prange
+from ..native_fir.fir_decimator import fir_decimate_chunk_core as _fir_decimate_chunk_core
 
 @dataclass
 class FIRDecimatorState:
@@ -127,125 +127,63 @@ def create_fir_decimator_state(num_channels: int, num_taps: int, decim: int) -> 
     return FIRDecimatorState(prev_input=prev_input, phase=phase)
 
 
-@njit(cache=True, fastmath=True, parallel=True)
-def _fir_decimate_chunk_core(
-    dsd_ext_cf: np.ndarray,    # shape = (channels, N_ext), float32
-    taps: np.ndarray,          # shape = (L,), float32
-    decim: int,
-    phase_init: int,           # dsd_ext[0] に対応する global index % decim
-    overlap: int,              # 通常 L-1
-    main_len: int,             # 本体サンプル数
-) -> np.ndarray:
-    """
-    float32 前提の高速版 (channels-first)。
-
-    dsd_ext_cf:
-        shape = (channels, N_ext)。先頭 overlap サンプルは前チャンクとのオーバーラップ。
-    taps:
-        FIR 係数。
-    decim:
-        デシメーション係数。
-    phase_init:
-        dsd_ext_cf[:, overlap] に対応する DSD グローバル index % decim。
-    overlap:
-        オーバーラップサンプル数。通常 len(taps)-1。
-    main_len:
-        このチャンクで本体として処理する DSD サンプル数。
-    """
-    num_channels, num_samples = dsd_ext_cf.shape
-    L = taps.shape[0]
-
-    if num_samples != overlap + main_len:
-        raise ValueError("dsd_ext length must be overlap + main_len.")
-
-    # 本体区間
-    start_main = overlap
-    end_main = overlap + main_len  # 非包含
-
-    # 出力候補の範囲 [n_min, n_max]
-    n_min = start_main
-    if L - 1 > n_min:
-        n_min = L - 1
-
-    n_max = end_main - 1
-    if n_min > n_max:
-        return np.empty((0, num_channels), dtype=np.float32)
-
-    # 条件: (phase_init + n) % decim == 0  <=>  n ≡ (-phase_init) mod decim
-    phase_mod = phase_init % decim
-    n0 = (decim - phase_mod) % decim
-
-    # n >= n_min で n ≡ n0 (mod decim) となる最初の n を求める
-    if n0 >= n_min:
-        n_first = n0
-    else:
-        delta = n_min - n0
-        k0 = delta // decim
-        if n0 + k0 * decim < n_min:
-            k0 += 1
-        n_first = n0 + k0 * decim
-
-    if n_first > n_max:
-        return np.empty((0, num_channels), dtype=np.float32)
-
-    # 出力サンプル数
-    span = n_max - n_first
-    n_out = span // decim + 1
-
-    pcm = np.empty((n_out, num_channels), dtype=np.float32)
-
-    # ★ 出力サンプル方向に並列化
-    for i in prange(n_out):
-        n = n_first + i * decim
-        for ch in range(num_channels):
-            x = dsd_ext_cf[ch]  # shape = (N_ext,), contiguous
-            acc = np.float32(0.0)
-            # y[n] = Σ h[k] * x[n-k]
-            for k in range(L):
-                acc += taps[k] * x[n - k]
-            pcm[i, ch] = acc
-
-    return pcm
-
-
 def fir_decimate_chunk_stateless(
     dsd_ext: np.ndarray,
     taps: np.ndarray,
     decim: int,
-    global_start_index: int,
+    global_start_index: int,  # 本体 main[0] のグローバルインデックス
     overlap: int,
 ) -> np.ndarray:
-    """stateless な 1 チャンク用 FIR+decimator（float32, channels-first版）。"""
-    # 入力は (N_ext, ch) 前提。float32＋C連続に整えておく。
+    """stateless な 1 チャンク用 FIR+decimation（float32版）。
+
+    Parameters
+    ----------
+    dsd_ext:
+        shape = (N_ext, ch)。先頭 overlap サンプルはオーバーラップ部分、
+        続く main_len サンプルが今回のチャンク本体。
+    taps:
+        FIR 係数 (1D)。
+    decim:
+        decimation factor。
+    global_start_index:
+        本体 main[0] のグローバルインデックス（dsd 全体に対して）。
+    overlap:
+        オーバーラップサンプル数（通常 taps.size - 1）。
+    """
+    # 型とメモリレイアウトを Cython 側に合わせる
     dsd_ext32 = np.ascontiguousarray(dsd_ext, dtype=np.float32)
-
-    num_samples, num_channels = dsd_ext32.shape
-    main_len = num_samples - overlap
-    if main_len <= 0:
-        return np.empty((0, num_channels), dtype=np.float32)
-
-    L = taps.shape[0]
-    if overlap < L - 1:
-        raise ValueError("overlap must be at least L-1 for seamless processing.")
-
-    # channels-first に 1 回だけ転置して contiguous にする
-    dsd_ext_cf = np.ascontiguousarray(dsd_ext32.T)  # shape = (ch, N_ext)
-
     taps32 = np.ascontiguousarray(taps, dtype=np.float32)
 
-    # dsd_ext[0] に対応する global index
-    ext_start_index = global_start_index - overlap
-    phase_init = ext_start_index % decim
+    num_samples, num_channels = dsd_ext32.shape
 
+    if overlap < 0 or overlap > num_samples:
+        raise ValueError("invalid overlap")
+
+    # 本体サンプル数 = 全体 - overlap
+    main_len = num_samples - overlap
+    if main_len <= 0:
+        # 本体がない場合は空配列
+        return np.empty((0, num_channels), dtype=np.float64)
+
+    # dsd_ext[0] のグローバルインデックス
+    global_start_ext = global_start_index - overlap
+
+    # Cython コアに渡す位相 (0..decim-1)
+    phase_init = int(global_start_ext % decim)
+
+    # Cython 実装を呼び出し
     pcm = _fir_decimate_chunk_core(
-        dsd_ext_cf,
+        dsd_ext32,
         taps32,
         int(decim),
-        int(phase_init),
+        phase_init,
         int(overlap),
         int(main_len),
     )
+
+    # _fir_decimate_chunk_core は float64 を返す実装にしている想定
     return pcm
+
 
 def process_dsd_in_chunks_stateless(
     dsd_iter,
@@ -278,64 +216,46 @@ def process_dsd_in_chunks_stateless(
 
     # 直前までの末尾 overlap サンプル
     tail = None  # shape = (overlap, ch)
+
     # ファイル全体に対するグローバル DSD インデックス
-    global_index = 0
-
+    global_index = 0      # 次の main[0] のグローバルインデックス
+    tail = None
     agg_blocks = []
-    agg_count = 0  # 本体として貯めたサンプル数
+    agg_count = 0
 
-    for blk in dsd_iter:
-        if blk.size == 0:
-            continue
-        agg_blocks.append(blk)
-        agg_count += blk.shape[0]
+    for dsd_block in dsd_iter:
+        agg_blocks.append(dsd_block)
+        agg_count += dsd_block.shape[0]
 
         while agg_count >= chunk_dsd_samples:
-            # チャンク本体を取り出す
-            # agg_blocks から chunk_dsd_samples 分を切り出す（実装簡略化のため concat）
+            # チャンク本体
             big = np.concatenate(agg_blocks, axis=0)
             main = big[:chunk_dsd_samples, :]
             rest = big[chunk_dsd_samples:, :]
 
-            # 残りは次のチャンクの先頭として使う
             agg_blocks = [rest] if rest.shape[0] > 0 else []
             agg_count = rest.shape[0]
 
-            # オーバーラップ付き入力を作る
+            # オーバーラップ部分を用意
             if tail is None:
-                # ファイル最初のチャンク：オーバーラップは 0 埋め
                 ch = main.shape[1]
                 tail = np.zeros((overlap, ch), dtype=np.float32)
-            # dsd_ext = [tail; main]
+
             dsd_ext = np.concatenate([tail, main.astype(np.float32)], axis=0)
 
-            # このチャンク本体先頭のグローバル index
-            g_start = global_index
-
-            # FIR + decimation
+            # ここで global_index は main[0] のグローバルインデックス
             pcm_chunk = fir_decimate_chunk_stateless(
                 dsd_ext,
                 taps,
                 decim,
-                global_start_index=g_start,
+                global_start_index=global_index,
                 overlap=overlap,
             )
-
             yield pcm_chunk
 
-            # tail を更新（今回処理した本体の末尾 overlap サンプル）
-            concat_for_tail = np.concatenate([tail, main], axis=0)
-            if concat_for_tail.shape[0] >= overlap:
-                tail = concat_for_tail[-overlap:, :]
-            else:
-                # ここに来るのはほぼありえないが、保険
-                pad = overlap - concat_for_tail.shape[0]
-                ch = concat_for_tail.shape[1]
-                new_tail = np.zeros((overlap, ch), dtype=np.float32)
-                new_tail[pad:, :] = concat_for_tail
-                tail = new_tail
-
-            global_index += main.shape[0]
+            # 次のチャンク用に tail と global_index を更新
+            tail = main[-overlap:, :].astype(np.float32)
+            global_index += chunk_dsd_samples
 
     # 余りがあれば最後のチャンクとして処理
     if agg_count > 0:

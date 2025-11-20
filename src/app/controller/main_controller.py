@@ -20,7 +20,7 @@ class ConversionController(QtCore.QObject):
         super().__init__(parent)
         self.window = window
 
-        self._executor: concurrent.futures.ProcessPoolExecutor | None = None
+        self._executor: concurrent.futures.Executor | None = None
         self._futures: Dict[concurrent.futures.Future, int] = {}
         self._poll_timer = QtCore.QTimer(self)
         self._poll_timer.setInterval(200)
@@ -80,9 +80,10 @@ class ConversionController(QtCore.QObject):
             pcm_samplerate=fs_pcm,
             stopband_hz=stopband_hz,
             stopband_atten_db=atten_db,
+            max_workers = max((os.cpu_count() // max_workers) , 1),
         )
 
-        self._executor = concurrent.futures.ProcessPoolExecutor(
+        self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers,
         )
         self._futures.clear()
